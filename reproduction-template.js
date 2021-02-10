@@ -28,23 +28,50 @@ async function main() {
   // Your reproduction
   ///////////////////////////////////////////////////////////////
 
-  await Person.query().insertGraph({
-    firstName: 'Jennifer',
-    lastName: 'Lawrence',
+  // Grab a connection from the pool. We're using sqlite3 for which knex
+  // uses a max pool size of 1, so the DB connection pool will be empty
+  // after this line.
+  const trx = await Person.startTransaction();
 
-    pets: [
-      {
-        name: 'Doggo',
-        species: 'dog'
-      }
-    ]
-  });
+  // Now that the DB connection pool is empty, make a query without
+  // using the above transaction. This will attempt to get another
+  // connection from the pool which will time out. This seems to put
+  // Objection into a weird state that causes future queries to fail.
+  try {
+    await Person.query().withGraphJoined('pets');
+  } catch (e) {
+    chai.expect(e).to.be.an.instanceof(Knex.KnexTimeoutError);
+  }
 
-  const jennifer = await Person.query()
-    .findOne({ firstName: 'Jennifer' })
-    .withGraphFetched('pets');
+  // Release the first connection so the connection pool has free
+  // connections again.
+  trx.rollback();
 
-  chai.expect(jennifer.pets[0].name).to.equal('Doggo');
+  console.log(Date.now(), 'Attempting another query.');
+  try {
+    // This incorrectly throws KnexTimeoutError. If you look at the
+    // timestamps in the log messages you'll see that it fails
+    // immediately. If it truly timed out then the exception would
+    // happen two seconds later (or whatever the configured pool
+    // timeout is).
+    //
+    // Some interesting data points:
+    // - This query only fails if both this query and the above query
+    //   use withGraphJoined().
+    // - This query only fails if the above query runs early on in the
+    //   life of the process. For example, if you copy/paste the query
+    //   to the top of this script before the call to
+    //   Person.startTransaction() so that it runs successfully once,
+    //   and leave everything else the same, then this query succeeds!
+    //   I looked at the some of the eager operation code... I see some
+    //   references to fetchTableMetadata() that look like it does a
+    //   preliminary query before doing the actual query. Is it possible
+    //   that query is failing and leaving something in a weird state?
+    await Person.query().withGraphJoined('pets');
+  } catch (e) {
+    console.error(Date.now(), 'It failed! This should not have happened. Error was', e);
+    chai.expect.fail('Query failed.');
+  }
 }
 
 ///////////////////////////////////////////////////////////////
@@ -55,6 +82,12 @@ const knex = Knex({
   client: 'sqlite3',
   useNullAsDefault: true,
   debug: false,
+  pool: {
+    // Set shorter timeouts because the defaults are long and we don't
+    // want to wait that long every time we run this test.
+    acquireTimeoutMillis: 2000,
+    createTimeoutMillis: 2000
+  },
   connection: {
     filename: ':memory:'
   }
